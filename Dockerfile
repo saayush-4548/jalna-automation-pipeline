@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 
+# Copy the static assets into the image
+COPY Jalana_AOI.geojson /workspace/data/
+COPY 10_parcels_clean.geojson         /workspace/data/
+COPY sowing_dates.json                /workspace/data/
+
 # Python deps
 COPY requirements.txt /workspace/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
@@ -18,6 +23,7 @@ COPY Jalna_Pipeline.ipynb   /workspace/Jalna_Pipeline.ipynb
 COPY entrypoint.sh          /workspace/entrypoint.sh
 # COPY ingest_rasters.py      /workspace/ingest_rasters.py
 # COPY db_normalize.py        /workspace/db_normalize.py
+COPY cdse_auth.py           /workspace/cdse_auth.py
 RUN chmod +x /workspace/entrypoint.sh
 
 # SageMaker Processing invokes ContainerEntrypoint from AppSpecification

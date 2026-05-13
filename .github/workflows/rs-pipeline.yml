@@ -4,13 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       fecha_inicio:
-        required: true
-        description: "Inference window start date (YYYY-MM-DD)"
-        default: "2026-04-20"
+        description: "Search window start (YYYY-MM-DD). Leave blank to auto-compute (today - 3)."
+        required: false
+        default: ""
       fecha_fin:
-        required: true
-        description: "Inference window end date (YYYY-MM-DD)"
-        default: "2026-05-06"
+        description: "Search window end (YYYY-MM-DD). Leave blank to auto-compute (today)."
+        required: false
+        default: ""
+      fechas:
+        description: "Target processing date (YYYY-MM-DD). Leave blank to auto-compute (today - 1)."
+        required: false
+        default: ""
       instance_type:
         required: false
         default: "ml.m6i.8xlarge"
@@ -18,14 +22,15 @@ on:
       max_retries:
         required: false
         default: "3"
-        description: "In-container papermill retries (MAX_RETRIES in entrypoint.sh)"
+        description: "In-container papermill retries"
       retry_delay:
         required: false
         default: "120"
-        description: "Seconds between in-container retries (RETRY_DELAY in entrypoint.sh)"
-  # Optional: scheduled run every 5 days at 03:00 UTC (matches S2 revisit)
+        description: "Seconds between in-container retries"
+
+  # Daily at 03:00 UTC — processes yesterday's S2 acquisition (T-1 target)
   schedule:
-    - cron: "0 3 */5 * *"
+    - cron: "0 3 * * *"
 
 env:
   AWS_REGION: us-east-1
@@ -33,16 +38,71 @@ env:
   SAGEMAKER_ROLE: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/SageMakerExecutionRole
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Step 0: Resolve dates once (manual override OR auto-compute)
+  #
+  # Rule: "to run for target T, we run on T+1"
+  #   fecha_fin    = today                (run day)
+  #   fechas       = today - 1            (target date)
+  #   fecha_inicio = today - 3            (search window start; 3-day window)
+  #
+  # For scheduled runs the inputs are always empty → always auto-computed.
+  # For manual runs, user can override any field by typing a date.
+  # ───────────────────────────────────────────────────────────────────────────
+  dates:
+    name: Resolve dates
+    runs-on: ubuntu-latest
+    outputs:
+      fecha_inicio: ${{ steps.compute.outputs.fecha_inicio }}
+      fecha_fin:    ${{ steps.compute.outputs.fecha_fin }}
+      fechas:       ${{ steps.compute.outputs.fechas }}
+    steps:
+      - name: Compute dates (with TZ=UTC)
+        id: compute
+        env:
+          IN_INICIO: ${{ github.event.inputs.fecha_inicio }}
+          IN_FIN:    ${{ github.event.inputs.fecha_fin }}
+          IN_FECHAS: ${{ github.event.inputs.fechas }}
+        run: |
+          set -euo pipefail
+
+          # Defaults derived from UTC "today" (matches your cron at 03:00 UTC).
+          TODAY=$(date -u +%Y-%m-%d)
+          AUTO_FIN="${TODAY}"
+          AUTO_FECHAS=$(date -u -d "${TODAY} - 1 day" +%Y-%m-%d)
+          AUTO_INICIO=$(date -u -d "${TODAY} - 3 days" +%Y-%m-%d)
+
+          FECHA_INICIO="${IN_INICIO:-$AUTO_INICIO}"
+          FECHA_FIN="${IN_FIN:-$AUTO_FIN}"
+          FECHAS="${IN_FECHAS:-$AUTO_FECHAS}"
+
+          # Sanity check: target must lie inside [inicio, fin]
+          if [[ "$FECHAS" < "$FECHA_INICIO" || "$FECHAS" > "$FECHA_FIN" ]]; then
+            echo "❌ fechas ($FECHAS) is outside [$FECHA_INICIO, $FECHA_FIN]"
+            exit 1
+          fi
+
+          echo "Resolved dates:"
+          echo "  fecha_inicio = $FECHA_INICIO"
+          echo "  fecha_fin    = $FECHA_FIN"
+          echo "  fechas       = $FECHAS"
+
+          {
+            echo "fecha_inicio=$FECHA_INICIO"
+            echo "fecha_fin=$FECHA_FIN"
+            echo "fechas=$FECHAS"
+          } >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────────
   build:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
+    needs: dates
     outputs:
       image_uri: ${{ steps.push.outputs.image_uri }}
-
     permissions:
       id-token: write
       contents: read
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -64,27 +124,21 @@ jobs:
         run: |
           IMAGE_TAG="${GITHUB_SHA::8}"
           IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-
-          echo "Building image: ${IMAGE_URI}"
+          echo "Building: ${IMAGE_URI}"
           docker build -t "${IMAGE_URI}" .
-
           docker tag "${IMAGE_URI}" "${REGISTRY}/${ECR_REPOSITORY}:latest"
-
           docker push "${IMAGE_URI}"
           docker push "${REGISTRY}/${ECR_REPOSITORY}:latest"
-
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "Built and pushed: ${IMAGE_URI}"
 
+  # ───────────────────────────────────────────────────────────────────────────
   run:
     name: Run Jalna on SageMaker
-    needs: build
+    needs: [dates, build]
     runs-on: ubuntu-latest
-
     permissions:
       id-token: write
       contents: read
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -98,19 +152,15 @@ jobs:
       - name: Install Python dependencies
         run: pip install boto3
 
-      - name: Set image URI
-        id: image
-        run: |
-          echo "uri=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/jalna-pipeline:latest" >> "$GITHUB_OUTPUT"
-
       - name: Submit and wait for Jalna processing job
         env:
-          IMAGE_URI:          ${{ steps.image.outputs.uri }}
-          FECHA_INICIO:       ${{ inputs.fecha_inicio }}
-          FECHA_FIN:          ${{ inputs.fecha_fin }}
-          INSTANCE_TYPE:      ${{ inputs.instance_type || 'ml.m6i.8xlarge' }}
-          MAX_RETRIES:        ${{ inputs.max_retries || '3' }}
-          RETRY_DELAY:        ${{ inputs.retry_delay || '120' }}
+          IMAGE_URI:          ${{ needs.build.outputs.image_uri }}
+          FECHA_INICIO:       ${{ needs.dates.outputs.fecha_inicio }}
+          FECHA_FIN:          ${{ needs.dates.outputs.fecha_fin }}
+          FECHAS:             ${{ needs.dates.outputs.fechas }}
+          INSTANCE_TYPE:      ${{ github.event.inputs.instance_type || 'ml.m6i.8xlarge' }}
+          MAX_RETRIES:        ${{ github.event.inputs.max_retries  || '3' }}
+          RETRY_DELAY:        ${{ github.event.inputs.retry_delay  || '120' }}
           SAGEMAKER_ROLE:     arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/AmazonSagemaker-ExecutionRole-StomaSense
           AWS_REGION:         ${{ env.AWS_REGION }}
           S3_BUCKET:          carrier-pdfs
@@ -122,6 +172,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
-          REDIS_FLUSH_URL: ${{ secrets.REDIS_FLUSH_URL }}
-          REDIS_AUTH_TOKEN: ${{ secrets.REDIS_AUTH_TOKEN }}
         run: python .github/scripts/run_mills.py

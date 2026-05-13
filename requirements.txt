@@ -1,15 +1,33 @@
+# Core data / numerics
 pandas
 numpy
+pyarrow
+
+# Geospatial
 geopandas
 rasterio
 shapely
+mgrs
+
+# Remote sensing API
 openeo
+
+# ML
 scikit-learn
 scipy
 tqdm
+
+# AWS / orchestration
+boto3
+papermill
+ipykernel
+
+# HTTP
+requests
+
+# Database (for the commented-out ingest_rasters.py / db_normalize.py)
 sqlalchemy
 psycopg2-binary
-requests
-mgrs
-boto3
-pyarrow
+
+# Plotting (notebook imports matplotlib in Cell 4)
+matplotlib

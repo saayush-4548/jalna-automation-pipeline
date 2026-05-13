@@ -18,13 +18,14 @@ from botocore.exceptions import ClientError
 IMAGE_URI       = os.environ["IMAGE_URI"]
 FECHA_INICIO    = os.environ["FECHA_INICIO"]
 FECHA_FIN       = os.environ["FECHA_FIN"]
+FECHAS          = os.environ["FECHAS"]
 INSTANCE_TYPE   = os.environ.get("INSTANCE_TYPE", "ml.m6i.8xlarge")
 MAX_RETRIES     = os.environ.get("MAX_RETRIES", "3")
 RETRY_DELAY     = os.environ.get("RETRY_DELAY", "120")
 SAGEMAKER_ROLE  = os.environ["SAGEMAKER_ROLE"]
-AWS_REGION      = os.environ["AWS_REGION"]
-S3_BUCKET       = os.environ["S3_BUCKET"]
-S3_PREFIX       = os.environ["S3_PREFIX"]
+AWS_REGION      = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET       = os.environ.get("S3_BUCKET", "carrier-pdfs")
+S3_PREFIX       = os.environ.get("S3_PREFIX", "JALNA")
 
 # Secrets to forward into the container
 PASSTHROUGH_ENV_VARS = [
@@ -32,7 +33,6 @@ PASSTHROUGH_ENV_VARS = [
     "COPERNICUS_USERNAME", "COPERNICUS_PASSWORD", "COPERNICUS_CLIENT_ID",
     "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
     "DB_CONNECTION_STRING",
-    "REDIS_FLUSH_URL", "REDIS_AUTH_TOKEN",
 ]
 
 # ── Build job ────────────────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ job_name = f"jalna-pipeline-{timestamp}"
 container_env = {
     "FECHA_INICIO": FECHA_INICIO,
     "FECHA_FIN":    FECHA_FIN,
+    "FECHAS":       FECHAS,
     "MAX_RETRIES":  MAX_RETRIES,
     "RETRY_DELAY":  RETRY_DELAY,
     "S3_BUCKET":    S3_BUCKET,

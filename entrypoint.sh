@@ -3,18 +3,6 @@ set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Jalna Pipeline — Entrypoint
-#
-# Flow:
-#   1. Validate required env vars
-#   2. Targeted S3 sync DOWN (single AOI — no mill case statement needed)
-#   3. Verify static assets (AOI, parcels, sowing_dates)
-#   4. Run notebook via papermill (auto-retry up to MAX_RETRIES)
-#   5. Push output notebook to S3 (always — captures failure detail)
-#   6. Ingest rasters → GCS + Supabase
-#   7. Normalize DB
-#   8. Targeted S3 sync UP
-#   9. Flush Redis cache
-#  10. Notify Microsoft Teams
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -26,31 +14,27 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MAX_RETRIES="${MAX_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-120}"
 
-# ── Validation ────────────────────────────────────────────────────────────────
-REQUIRED_VARS=(FECHA_INICIO FECHA_FIN COPERNICUS_USERNAME COPERNICUS_PASSWORD)
+# ── Validation (FECHAS added — entrypoint USES it on the papermill line) ─────
+REQUIRED_VARS=(FECHA_INICIO FECHA_FIN FECHAS COPERNICUS_USERNAME COPERNICUS_PASSWORD)
 MISSING=()
 for var in "${REQUIRED_VARS[@]}"; do
     [[ -z "${!var:-}" ]] && MISSING+=("$var")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "❌ Missing required environment variables: ${MISSING[*]}"
-    echo ""
-    echo "   Required:"
-    echo "     FECHA_INICIO  - inference window start (YYYY-MM-DD)"
-    echo "     FECHA_FIN     - inference window end   (YYYY-MM-DD)"
-    echo "     COPERNICUS_USERNAME / COPERNICUS_PASSWORD"
+    echo "   Required: FECHA_INICIO, FECHA_FIN, FECHAS, COPERNICUS_USERNAME, COPERNICUS_PASSWORD"
     exit 1
 fi
 
-# ── Fixed paths (Jalna has one AOI — no mill case statement) ──────────────────
+# ── Fixed paths (Jalna has one AOI) ───────────────────────────────────────────
 AOI_FILE="Jalana_AOI_extended_east.geojson"
 PARCELS_FILE="10_parcels_clean.geojson"
 SOWING_FILE="sowing_dates.json"
 SITE="JL"
 
-WORK_DIR="jalna-auto"          # equivalent to {mill}-auto: pairs/ + cloudfill_out/
-INPUT_DIR="inputs-jalna-auto"  # static inputs (AOI, parcels, sowing)
-OUTPUT_DIR="Output-jalna"      # KPI parquets + final tiffs for ingestion
+WORK_DIR="jalna-auto"
+INPUT_DIR="inputs-jalna-auto"
+OUTPUT_DIR="Output-jalna"
 
 S3_BASE="s3://${S3_BUCKET}/${S3_PREFIX}"
 OUTPUT_NB="${WORKSPACE}/notebook_output_JALNA_${TIMESTAMP}.ipynb"
@@ -73,6 +57,7 @@ teams_notify() {
                 \"activityTitle\": \"Jalna Pipeline — ${status^^}\",
                 \"facts\": [
                     { \"name\": \"Site\",       \"value\": \"Jalna (${SITE})\" },
+                    { \"name\": \"Target date\", \"value\": \"${FECHAS}\" },
                     { \"name\": \"Window\",     \"value\": \"${FECHA_INICIO} → ${FECHA_FIN}\" },
                     { \"name\": \"Status\",     \"value\": \"${message}\" },
                     { \"name\": \"Timestamp\",  \"value\": \"${TIMESTAMP}\" },
@@ -82,7 +67,6 @@ teams_notify() {
         }" || echo "⚠️  Teams notification failed"
 }
 
-# ── S3 helpers ────────────────────────────────────────────────────────────────
 s3_sync_down() {
     local s3_path="$1" local_path="$2"
     echo "   📥  ${s3_path}  →  ${local_path}"
@@ -98,8 +82,6 @@ s3_sync_up() {
         aws s3 sync "${local_path}" "${s3_path}" --no-progress \
             --exclude "__pycache__/*" --exclude "*.pyc" \
             --exclude ".ipynb_checkpoints/*"
-    else
-        echo "   ⊙   ${local_path} does not exist — skipping"
     fi
 }
 
@@ -109,6 +91,7 @@ echo "╔═══════════════════════�
 echo "║  Jalna Pipeline                                                  ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 printf "║  %-64s║\n" "Site:        Jalna (${SITE})"
+printf "║  %-64s║\n" "Target:      ${FECHAS}"
 printf "║  %-64s║\n" "Window:      ${FECHA_INICIO} → ${FECHA_FIN}"
 printf "║  %-64s║\n" "Max retries: ${MAX_RETRIES}"
 printf "║  %-64s║\n" "S3:          ${S3_BASE}/"
@@ -117,28 +100,20 @@ echo ""
 
 # ── Step 1: S3 sync DOWN ──────────────────────────────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📥  Syncing required files from S3"
+echo "📥  Syncing static + stateful inputs from S3"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Static single files
-aws s3 cp "${S3_BASE}/static/${AOI_FILE}"     "${WORKSPACE}/${AOI_FILE}"     || echo "⚠️  AOI not found"
-aws s3 cp "${S3_BASE}/static/${PARCELS_FILE}" "${WORKSPACE}/${PARCELS_FILE}" || echo "⚠️  Parcels not found"
-aws s3 cp "${S3_BASE}/static/${SOWING_FILE}"  "${WORKSPACE}/${SOWING_FILE}"  || echo "⚠️  Sowing dates not found"
+# Static files: S3 → /workspace/ (overrides baked-in copies if newer)
+aws s3 cp "${S3_BASE}/static/${AOI_FILE}"     "${WORKSPACE}/${AOI_FILE}"     || echo "⚠️  AOI not on S3, using baked-in"
+aws s3 cp "${S3_BASE}/static/${PARCELS_FILE}" "${WORKSPACE}/${PARCELS_FILE}" || echo "⚠️  Parcels not on S3, using baked-in"
+aws s3 cp "${S3_BASE}/static/${SOWING_FILE}"  "${WORKSPACE}/${SOWING_FILE}"  || echo "⚠️  Sowing not on S3, using baked-in"
 
-# Stateful directories (pairs/ rehydration is the warm-start optimization)
 s3_sync_down "${S3_BASE}/${WORK_DIR}/"   "${WORKSPACE}/${WORK_DIR}/"
 s3_sync_down "${S3_BASE}/${INPUT_DIR}/"  "${WORKSPACE}/${INPUT_DIR}/"
 s3_sync_down "${S3_BASE}/${OUTPUT_DIR}/" "${WORKSPACE}/${OUTPUT_DIR}/"
-
-echo ""
-echo "✅  S3 sync down complete"
 echo ""
 
-# ── Step 1.1: Verify Critical Assets ──────────────────────────────────────────
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🔍  Verifying critical input assets"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+# ── Verify critical assets ───────────────────────────────────────────────────
 ASSET_ERROR=0
 for f in "${AOI_FILE}" "${PARCELS_FILE}" "${SOWING_FILE}"; do
     if [[ -f "${WORKSPACE}/${f}" ]]; then
@@ -148,15 +123,10 @@ for f in "${AOI_FILE}" "${PARCELS_FILE}" "${SOWING_FILE}"; do
         ASSET_ERROR=1
     fi
 done
-
 if [[ ${ASSET_ERROR} -eq 1 ]]; then
-    echo ""
-    echo "❌ ERROR: Critical assets missing. Path checked: ${S3_BASE}/static/"
-    teams_notify "failure" "Missing AOI/parcels/sowing assets in S3."
+    teams_notify "failure" "Missing AOI/parcels/sowing assets in /workspace."
     exit 1
 fi
-
-echo "   🚀 All assets verified."
 echo ""
 
 # ── Step 2: Run notebook with retry ───────────────────────────────────────────
@@ -166,25 +136,23 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 ATTEMPT=0
 NOTEBOOK_EXIT=1
-
 while [[ ${ATTEMPT} -lt ${MAX_RETRIES} ]]; do
     ATTEMPT=$(( ATTEMPT + 1 ))
     echo ""
     echo "▶  Attempt ${ATTEMPT} / ${MAX_RETRIES}  ($(date '+%Y-%m-%d %H:%M:%S'))"
 
+    # Only inject parameters that the notebook actually accepts.
+    # Cell 2 currently declares: target_date, fecha_inicio_str, fecha_fin_str, BASE_DIR_STR
+    # (and IS_PROD path block sets AOI / PARCELS / SOWING / KPI dirs from /workspace)
     if papermill \
         "${NOTEBOOK}" \
         "${OUTPUT_NB}" \
         --no-progress-bar --log-output --kernel python3 \
         --cwd "${WORKSPACE}" \
-        -p AOI_GEOJSON       "${WORKSPACE}/${AOI_FILE}" \
-        -p PARCELS_GEOJSON   "${WORKSPACE}/${PARCELS_FILE}" \
-        -p SOWING_DATES_PATH "${WORKSPACE}/${SOWING_FILE}" \
+        -p target_date       "${FECHAS}" \
         -p fecha_inicio_str  "${FECHA_INICIO}" \
         -p fecha_fin_str     "${FECHA_FIN}" \
-        -p BASE_DIR          "${WORKSPACE}/${WORK_DIR}" \
-        -p RUN_S3_UPLOAD_RAW     False \
-        -p RUN_S3_UPLOAD_OUTPUTS False; then
+        -p BASE_DIR_STR      "${WORKSPACE}/${WORK_DIR}"; then
         NOTEBOOK_EXIT=0
         echo ""; echo "✅  Notebook succeeded on attempt ${ATTEMPT}"
         break
@@ -200,69 +168,32 @@ done
 
 # ── Step 3: Push output notebook to S3 (always) ───────────────────────────────
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📓  Uploading run log notebook"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
 if [[ -f "${OUTPUT_NB}" ]]; then
     aws s3 cp "${OUTPUT_NB}" "${S3_OUTPUT_NB}" --no-progress \
-        && echo "   ✅  ${S3_OUTPUT_NB}" \
-        || echo "   ⚠️  Failed to upload run log"
+        && echo "📓  Run log uploaded: ${S3_OUTPUT_NB}" \
+        || echo "⚠️  Failed to upload run log"
 else
-    echo "   ⚠️  Output notebook not found (papermill may have crashed before writing)"
+    echo "⚠️  Output notebook not found (papermill crashed early)"
 fi
 
-# ── Step 4: Post-success ingestion + sync up ──────────────────────────────────
+# ── Step 4: Post-success sync up ──────────────────────────────────────────────
 if [[ ${NOTEBOOK_EXIT} -eq 0 ]]; then
-
-    # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    # echo "📦  Ingesting Rasters to GCS & Supabase"
-    # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    # python3 /workspace/ingest_rasters.py "${WORKSPACE}/${WORK_DIR}/cloudfill_out" || {
-    #     echo "❌ Ingestion failed!"
-    #     teams_notify "failure" "Ingestion phase failed for Jalna."
-    #     exit 1
-    # }
-
-    # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    # echo "🧹  Normalizing Database (SQL Updates)"
-    # echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    # python3 /workspace/db_normalize.py || {
-    #     echo "❌ SQL Normalization failed!"
-    #     exit 1
-    # }
-
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "📤  Syncing updated files to S3"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
     s3_sync_up "${WORKSPACE}/${WORK_DIR}/"   "${S3_BASE}/${WORK_DIR}/"
     s3_sync_up "${WORKSPACE}/${INPUT_DIR}/"  "${S3_BASE}/${INPUT_DIR}/"
     s3_sync_up "${WORKSPACE}/${OUTPUT_DIR}/" "${S3_BASE}/${OUTPUT_DIR}/"
-
-    echo ""
-    echo "✅  S3 sync up complete"
 fi
 
-# # ── Step 5: Flush Redis Cache ─────────────────────────────────────────────────
-# if [[ -n "${REDIS_FLUSH_URL:-}" && -n "${REDIS_AUTH_TOKEN:-}" ]]; then
-#     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-#     echo "🧹  Flushing Redis Cache (Upstash)"
-#     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-#     curl -s -X POST "${REDIS_FLUSH_URL}" \
-#          -H "Authorization: Bearer ${REDIS_AUTH_TOKEN}" -d "" \
-#          || echo "⚠️  Redis flush failed (non-critical)"
-# fi
-
-# ── Step 6: Teams notification ────────────────────────────────────────────────
+# ── Step 5: Notify ────────────────────────────────────────────────────────────
 echo ""
 if [[ ${NOTEBOOK_EXIT} -eq 0 ]]; then
     echo "🎉  Jalna pipeline finished successfully"
-    teams_notify "success" "Completed after ${ATTEMPT} attempt(s). Results synced to S3."
+    teams_notify "success" "Completed after ${ATTEMPT} attempt(s)."
 else
     echo "❌  Jalna pipeline failed after ${MAX_RETRIES} attempts"
-    teams_notify "failure" "Failed after ${MAX_RETRIES} attempts. Check run log: ${S3_OUTPUT_NB}"
+    teams_notify "failure" "Failed after ${MAX_RETRIES} attempts. Run log: ${S3_OUTPUT_NB}"
     exit 1
 fi
-echo ""

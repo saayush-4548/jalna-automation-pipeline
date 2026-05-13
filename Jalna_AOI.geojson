@@ -1,0 +1,1 @@
+{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"name": "Jalna_AOI", "description": "Bounding Box of points A, B, C, D"}, "geometry": {"type": "Polygon", "coordinates": [[[75.5730393, 19.2546025], [75.9498503, 19.2546025], [75.9498503, 19.5980806], [75.5730393, 19.5980806], [75.5730393, 19.2546025]]]}}]}
