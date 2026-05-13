@@ -1,0 +1,15 @@
+pandas
+numpy
+geopandas
+rasterio
+shapely
+openeo
+scikit-learn
+scipy
+tqdm
+sqlalchemy
+psycopg2-binary
+requests
+mgrs
+boto3
+pyarrow
