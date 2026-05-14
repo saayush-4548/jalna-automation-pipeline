@@ -29,8 +29,8 @@ on:
         description: "Seconds between in-container retries"
 
   # Daily at 03:00 UTC — processes yesterday's S2 acquisition (T-1 target)
-  schedule:
-    - cron: "0 3 * * *"
+  # schedule:
+  #   - cron: "0 3 * * *"
 
 env:
   AWS_REGION: us-east-1
